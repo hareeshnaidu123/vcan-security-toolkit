@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""
+Automotive CAN Bus Security Analysis & Defensive Engineering Lab
+Consolidated Single-File Laboratory Suite
+
+Prerequisites:
+  - Linux with SocketCAN kernel support
+  - sudo apt install can-utils
+  - pip install python-can
+"""
+
+import argparse
+import hashlib
+import hmac
+import os
+import subprocess
+import sys
+import threading
+import time
+from collections import defaultdict
+
+try:
+    import can
+except ImportError:
+    sys.exit("[!] Error: 'python-can' is missing. Run: pip install python-can")
+
+# --- Network & Protocol Constants ---
+DEFAULT_IFACE = "vcan0"
+PRE_SHARED_KEY = b"AutomotiveSecKey16Bytes!"
+
+ID_ENGINE_RPM = 0x110     # Interval: 20ms | Data: RPM (2 bytes)
+ID_VEHICLE_SPEED = 0x120   # Interval: 50ms | Data: Speed km/h (2 bytes * 100)
+ID_BRAKE_STATUS = 0x200    # Interval: 100ms | Data: State (1 byte)
+ID_SECOC_FRAME = 0x300     # Authenticated payload frame
+
+IDS_SPEC_RULES = {
+    ID_ENGINE_RPM: {"name": "ENGINE_RPM", "interval": 0.020, "tolerance": 0.015},
+    ID_VEHICLE_SPEED: {"name": "VEHICLE_SPEED", "interval": 0.050, "tolerance": 0.025},
+    ID_BRAKE_STATUS: {"name": "BRAKE_STATUS", "interval": 0.100, "tolerance": 0.040},
+}
+
+
+# ============================================================================
+# 1. Interface Setup & Provisioning
+# ============================================================================
+
+def setup_vcan(interface: str = DEFAULT_IFACE):
+    """Initializes kernel modules and creates the virtual CAN link."""
+    print(f"[*] Provisioning {interface}...")
+    try:
+        subprocess.run(["sudo", "modprobe", "can"], check=True)
+        subprocess.run(["sudo", "modprobe", "can_raw"], check=True)
+        subprocess.run(["sudo", "modprobe", "vcan"], check=True)
+
+        # Check existing interface status
+        res = subprocess.run(["ip", "link", "show", interface], capture_output=True, text=True)
+        if res.returncode == 0:
+            print(f"[*] Removing existing {interface}...")
+            subprocess.run(["sudo", "ip", "link", "set", "down", "dev", interface], check=True)
+            subprocess.run(["sudo", "ip", "link", "delete", interface, "type", "vcan"], check=True)
+
+        subprocess.run(["sudo", "ip", "link", "add", "dev", interface, "type", "vcan"], check=True)
+        subprocess.run(["sudo", "ip", "link", "set", "up", "dev", interface], check=True)
+        print(f"[+] Interface {interface} is UP and ready for traffic.")
+    except subprocess.CalledProcessError as err:
+        sys.exit(f"[!] Network setup failed (ensure sudo privileges): {err}")
+
+
+# ============================================================================
+# 2. Vehicle Telemetry Simulator (ECU Emulation)
+# ============================================================================
+
+def run_simulator(interface: str = DEFAULT_IFACE):
+    """Simulates realistic cyclic background traffic from powertrain ECUs."""
+    try:
+        bus = can.interface.Bus(channel=interface, bustype='socketcan')
+    except OSError as err:
+        sys.exit(f"[!] Cannot open {interface}: {err}. Did you run with --setup?")
+
+    print(f"[*] ECU Simulator running on {interface}. Press Ctrl+C to terminate.")
+    speed = 45.0
+    rpm = 2100
+
+    try:
+        while True:
+            # Emit Engine RPM (every loop)
+            rpm_bytes = int(rpm).to_bytes(2, byteorder='big') + b'\x00' * 6
+            bus.send(can.Message(arbitration_id=ID_ENGINE_RPM, data=rpm_bytes, is_extended_id=False))
+
+            # Emit Speed
+            raw_speed = int(speed * 100).to_bytes(2, byteorder='big') + b'\x00' * 6
+            bus.send(can.Message(arbitration_id=ID_VEHICLE_SPEED, data=raw_speed, is_extended_id=False))
+
+            # Minor sensor drift
+            speed = max(0.0, min(180.0, speed + 0.05))
+            rpm = max(800, min(6500, rpm + 3))
+
+            time.sleep(0.02)
+    except KeyboardInterrupt:
+        print("\n[-] Simulator stopped.")
+    finally:
+        bus.shutdown()
+
+
+# ============================================================================
+# 3. Defensive Monitor & Intrusion Detection (CAN-IDS)
+# ============================================================================
+
+def run_ids(interface: str = DEFAULT_IFACE):
+    """Inspects arrival rates and catches unregistered/flooding frame anomalies."""
+    try:
+        bus = can.interface.Bus(channel=interface, bustype='socketcan')
+    except OSError as err:
+        sys.exit(f"[!] Cannot bind to {interface}: {err}")
+
+    last_seen = {}
+    print(f"[*] CAN-IDS active on {interface}. Monitoring timing baselines...")
+
+    try:
+        for msg in bus:
+            now = time.time()
+            arb_id = msg.arbitration_id
+
+            if arb_id in IDS_SPEC_RULES:
+                spec = IDS_SPEC_RULES[arb_id]
+                if arb_id in last_seen:
+                    dt = now - last_seen[arb_id]
+                    expected = spec["interval"]
+                    tol = spec["tolerance"]
+
+                    # Alert on injection/flooding
+                    if dt < (expected - tol):
+                        print(f"\033[91m[!] IDS ALERT: Injection detected on {hex(arb_id)} ({spec['name']}) | dt={dt:.4f}s (Min: {expected-tol:.4f}s)\033[0m")
+                    elif dt > (expected + tol * 3):
+                        print(f"\033[93m[*] IDS WARN: Starvation/Delay on {hex(arb_id)} ({spec['name']}) | dt={dt:.4f}s\033[0m")
+                last_seen[arb_id] = now
+            else:
+                # Catch frames outside the authorized whitelist
+                print(f"\033[95m[!] IDS ALERT: Unregistered Arbitration ID observed: {hex(arb_id)}\033[0m")
+    except KeyboardInterrupt:
+        print("\n[-] IDS monitor terminated.")
+    finally:
+        bus.shutdown()
+
+
+# ============================================================================
+# 4. Cryptographic Validation (AUTOSAR SecOC Emulation)
+# ============================================================================
+
+def pack_secoc_frame(arb_id: int, payload: bytes, counter: int) -> bytes:
+    """
+    Standard 8-byte CAN 2.0B Layout:
+    [Data: 4 bytes] + [Freshness Counter: 2 bytes] + [Truncated CMAC/HMAC: 2 bytes]
+    """
+    counter_bytes = counter.to_bytes(2, byteorder='big')
+    mac_input = arb_id.to_bytes(2, byteorder='big') + counter_bytes + payload[:4]
+    mac = hmac.new(PRE_SHARED_KEY, mac_input, hashlib.sha256).digest()[:2]
+    return payload[:4] + counter_bytes + mac
+
+def verify_secoc_frame(arb_id: int, frame_data: bytes, last_seen_counter: int) -> tuple[bool, str, int]:
+    """Validates replay protection and payload cryptographic integrity."""
+    if len(frame_data) != 8:
+        return False, "Invalid frame length", last_seen_counter
+
+    payload = frame_data[:4]
+    rx_counter = int.from_bytes(frame_data[4:6], byteorder='big')
+    rx_mac = frame_data[6:8]
+
+    # Replay Protection: Check strictly incrementing monotonic freshness counter
+    if rx_counter <= last_seen_counter:
+        return False, f"Replay detected (Counter {rx_counter} <= {last_seen_counter})", last_seen_counter
+
+    # Compute expected truncated authentication code
+    mac_input = arb_id.to_bytes(2, byteorder='big') + frame_data[4:6] + payload
+    expected_mac = hmac.new(PRE_SHARED_KEY, mac_input, hashlib.sha256).digest()[:2]
+
+    if not hmac.compare_digest(rx_mac, expected_mac):
+        return False, "Cryptographic MAC signature mismatch", rx_counter
+
+    return True, "Authenticated", rx_counter
+
+def run_secoc_demo():
+    """Demonstrates live payload authentication, replay prevention, and tampering detection."""
+    print("[*] Running Secure Onboard Communication (SecOC) validation test...")
+    target_id = ID_SECOC_FRAME
+    counter = 100
+
+    # 1. Generate Valid Frame
+    payload = b"\x01\x02\x03\x04"
+    valid_frame = pack_secoc_frame(target_id, payload, counter)
+    print(f"\n1. Transmitting authentic frame (Counter: {counter}, Hex: {valid_frame.hex()})")
+    ok, reason, last_counter = verify_secoc_frame(target_id, valid_frame, 0)
+    print(f"   -> Verification Result: {'PASS' if ok else 'FAIL'} ({reason})")
+
+    # 2. Replay Attack
+    print(f"\n2. Replaying the identical frame (Simulated replay attack)...")
+    ok, reason, _ = verify_secoc_frame(target_id, valid_frame, last_counter)
+    print(f"   -> Verification Result: {'PASS' if ok else 'FAIL'} ({reason})")
+
+    # 3. Payload Tampering Attack
+    counter += 1
+    tampered_frame = pack_secoc_frame(target_id, payload, counter)
+    tampered_frame = b"\xFF" + tampered_frame[1:]  # Mutate first byte
+    print(f"\n3. Altering payload in transit (Counter: {counter}, Hex: {tampered_frame.hex()})")
+    ok, reason, _ = verify_secoc_frame(target_id, tampered_frame, last_counter)
+    print(f"   -> Verification Result: {'PASS' if ok else 'FAIL'} ({reason})")
+
+
+# ============================================================================
+# Main Entry Point & CLI Dispatcher
+# ============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Automotive CAN Bus Security Analysis & Defensive Suite",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Usage Examples:
+  sudo python3 can_security_lab.py --setup
+  python3 can_security_lab.py --sim
+  python3 can_security_lab.py --ids
+  python3 can_security_lab.py --secoc-demo
+        """
+    )
+    parser.add_argument("--interface", default=DEFAULT_IFACE, help=f"SocketCAN interface name (default: {DEFAULT_IFACE})")
+    parser.add_argument("--setup", action="store_true", help="Configure vcan kernel modules and bring up interface")
+    parser.add_argument("--sim", action="store_true", help="Start background ECU telemetry traffic")
+    parser.add_argument("--ids", action="store_true", help="Start real-time timing & frequency IDS monitor")
+    parser.add_argument("--secoc-demo", action="store_true", help="Run standalone SecOC authentication & tamper proofing demo")
+
+    args = parser.parse_args()
+
+    if args.setup:
+        setup_vcan(args.interface)
+    elif args.sim:
+        run_simulator(args.interface)
+    elif args.ids:
+        run_ids(args.interface)
+    elif args.secoc_demo:
+        run_secoc_demo()
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()
